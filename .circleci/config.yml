@@ -1,35 +1,31 @@
-# Golang CircleCI 2.0 configuration file
+version: 2.1
 
-version: 2
+executors:
+  pegaton:
+    machine: true
+    resource_class: parsurvan/pegaton-runner
 
 jobs:
   check:
-
     docker:
       - image: circleci/golang:1.10.3
     working_directory: /go/src/github.com/DSiSc/justitia
-
     steps:
       - checkout
-
       - run:
           name: Get dependencies
           command: make devenv
-
       - run:
           name: Static checks
           command: make static-check
-
       - run:
           name: Correctness check
           command: make build && make vet
-
       - run:
           name: Test with coverage
           command: |
             make coverage
             bash <(curl -s https://codecov.io/bash)
-
       - persist_to_workspace:
           root: ./build
           paths:
@@ -55,6 +51,66 @@ jobs:
           pyresttest http://localhost:47768 testcases_tx.yaml
           pkill justitia
 
+  deploy-justitia:
+    executor: pegaton
+    steps:
+      - run:
+          name: Start Justitia 3-node chain
+          command: |
+            for n in 1 2 3; do
+              docker rm -f justitia-$n 2>/dev/null || true
+            done
+            docker run -d --name justitia-1 --network dockerprivate --ip 10.0.0.30 \
+              --restart unless-stopped \
+              -v /root/.justitia/node2/config.yaml:/root/.justitia/justitia.yaml:ro \
+              -v /root/.justitia/data/full:/var/lib/justitia \
+              -v /root/.justitia/logs/full:/var/log/justitia \
+              justitia:latest
+            docker run -d --name justitia-2 --network dockerprivate --ip 10.0.0.31 \
+              --restart unless-stopped \
+              -v /root/.justitia/node1/config.yaml:/root/.justitia/justitia.yaml:ro \
+              -v /root/.justitia/data/consensus:/var/lib/justitia \
+              -v /root/.justitia/logs/consensus:/var/log/justitia \
+              justitia:latest
+            docker run -d --name justitia-3 --network dockerprivate --ip 10.0.0.32 \
+              --restart unless-stopped \
+              -v /root/.justitia/node3/config.yaml:/root/.justitia/justitia.yaml:ro \
+              -v /root/.justitia/data/light:/var/lib/justitia \
+              -v /root/.justitia/logs/light:/var/log/justitia \
+              justitia:latest
+      - run:
+          name: Health check Justitia nodes
+          command: |
+            for ip in 10.0.0.30 10.0.0.31 10.0.0.32; do
+              for i in $(seq 1 30); do
+                curl -sf --max-time 2 "http://$ip:47768" && echo "$ip UP" && break || sleep 2
+              done
+            done
+
+  wallet-stest:
+    executor: pegaton
+    steps:
+      - run:
+          name: Run wallet stest runbook
+          command: |
+            cd /root/go/src/github.com/Parsurvan/java-tron
+            ./gradlew run stest
+          no_output_timeout: 30m
+
+  deploy-browser-ui:
+    executor: pegaton
+    steps:
+      - run:
+          name: Start browser UI on Pegaton host
+          command: |
+            pkill -f 'browser.js' 2>/dev/null || true
+            sleep 1
+            nohup node /root/go/src/github.com/Parsurvan/xrp/bin/browser.js \
+              10.0.0.30 47768 0.0.0.0 8080 \
+              > /var/log/parsurvan-browser-ui.log 2>&1 &
+            sleep 3
+            curl -sf http://localhost:8080 && echo "browser UI up" || echo "browser UI check failed (may need a moment)"
+
 workflows:
   version: 2
   commit:
@@ -73,3 +129,12 @@ workflows:
     - rpctest:
         requires:
         - check
+  parsurvan-chain:
+    jobs:
+      - deploy-justitia
+      - wallet-stest:
+          requires:
+            - deploy-justitia
+      - deploy-browser-ui:
+          requires:
+            - deploy-justitia
